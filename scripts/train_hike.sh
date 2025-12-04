@@ -20,7 +20,7 @@ scene=("forest1" "forest2" "forest3" "garden1" "garden2" "garden3" "indoor" "pla
 
 for scene in "${scene[@]}"; do
     timestamp=$(date "+%Y-%m-%d_%H:%M:%S")
-    python train.py --eval -s ./data/hike/$scene -m outputs/hike/$scene/baseline/"$timestamp" -r 4 --port $port --mode hike
-    python render.py -m outputs/hike/$scene/baseline/"$timestamp"
-    python metrics.py -m outputs/hike/$scene/baseline/"$timestamp"
+    python train.py --eval -s ./data/hike/$scene -m outputs/hike/$scene/"$timestamp" -r 4 --port $port --mode hike
+    python render.py -m outputs/hike/$scene/"$timestamp"
+    python metrics.py -m outputs/hike/$scene/"$timestamp"
 done

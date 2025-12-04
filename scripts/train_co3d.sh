@@ -19,7 +19,7 @@ scenes=("apple/110_13051_23361" "bench/415_57112_110099" "hydrant/106_12648_2315
 
 for scene in "${scenes[@]}"; do
     timestamp=$(date "+%Y-%m-%d_%H:%M:%S")
-    python train.py --eval -s ./data/co3d/$scene -m outputs/co3d/$scene/baseline/"$timestamp" --port $port --mode co3d
-    python render.py -m outputs/co3d/$scene/baseline/"$timestamp"
-    python metrics.py -m outputs/co3d/$scene/baseline/"$timestamp"
+    python train.py --eval -s ./data/co3d/$scene -m outputs/co3d/$scene/"$timestamp" --port $port --mode co3d
+    python render.py -m outputs/co3d/$scene/"$timestamp"
+    python metrics.py -m outputs/co3d/$scene/"$timestamp"
 done

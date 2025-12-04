@@ -21,49 +21,19 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 from scene import Scene
 import json
 import time
-from gaussian_renderer import render, prefilter_voxel
+from gaussian_renderer import render
 import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel, generate_neural_gaussians
+from gaussian_renderer import GaussianModel
 from utils.visualize_utils import vis_depth, vis_pose, eval_pose_metrics
-from utils.pose_utils import update_pose, smooth_poses_spline, save_transforms
+from utils.pose_utils import smooth_poses_spline, save_transforms, visual_localization
 from scene.cameras import Camera
-from utils.loss_utils import l1_loss
 import cv2
 import imageio
-from utils.colmap_utils import save_points3D_text, save_imagestxt, save_cameras
-
-def pose_estimation_test(gaussians_pose, view, pipe, bg):
-    print("Pose estimation Cam%s" % view.uid)
-    pose_iteration = 500
-
-    pose_optimizer = torch.optim.Adam([{"params": [view.cam_trans_delta], "lr": 0.01}, {"params": [view.cam_rot_delta], "lr": 0.01}])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(pose_optimizer, T_max=pose_iteration)
-    gt_image = view.original_image.cuda()
-
-    progress_bar = tqdm(range(0, pose_iteration), desc="Pose estiamtion progress")
-    for iteration in range(pose_iteration):
-        voxel_visible_mask = prefilter_voxel(view, gaussians_pose, pipe, bg)
-        image = render(view, gaussians_pose, pipe, bg, visible_mask=voxel_visible_mask, retain_grad=True)["render"]
-        
-        Ll1 = l1_loss(image, gt_image)
-        loss = Ll1
-        loss.backward()
-
-        with torch.no_grad():
-            pose_optimizer.step()
-            pose_optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            update_pose(view)
-
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{loss:.{7}f}"})
-                progress_bar.update(10)
-       
-    progress_bar.close()
+from utils.colmap_utils import save_imagestxt, save_cameras
 
 def render_nvs(model_path, name, iteration, views, gaussians, pipeline, background):
     nvs_path = os.path.join(model_path, name, "ours_{}".format(iteration), "nvs")
@@ -96,8 +66,8 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
                          image=views[0].original_image, gt_alpha_mask=None, image_name=None, uid=None)
         nvs_view.update_RT(nvs_pose_list[i, :3, :3].transpose(0, 1), nvs_pose_list[i, :3, 3])
         nvs_view.to_final()
-        voxel_visible_mask = prefilter_voxel(nvs_view, gaussians, pipeline, background)
-        rendering = render(nvs_view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, retain_grad=False)
+        rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
+        voxel_visible_mask = rendering["visible_mask"]
         torchvision.utils.save_image(rendering["render"], os.path.join(nvs_path, '{0:05d}'.format(i) + ".png"))
         render_img = torch.clamp(rendering["render"], min=0., max=1.)
         render_img = (render_img.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
@@ -147,8 +117,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     gt_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         torch.cuda.synchronize(); t0 = time.time()
-        voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        rendering = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+        rendering = render(view, gaussians, pipeline, background)
+        voxel_visible_mask = rendering["visible_mask"]
         torch.cuda.synchronize(); t1 = time.time()
         
         t_list.append(t1-t0)
@@ -234,7 +204,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
             render_nvs(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
     if not skip_test:
-        for idx, viewpoint in enumerate(scene.getTestCameras()):
+        from utils.mast3r_utils import Mast3rMatcher
+        matcher = Mast3rMatcher()
+        
+        for idx, viewpoint in enumerate(tqdm(scene.getTestCameras(), desc="Processing test cameras")):
             if "hike_dataset" in dataset.model_path:
                 test_frame_every = 10
             elif "Tanks" in dataset.model_path:
@@ -244,9 +217,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             next_train_idx = viewpoint.uid * test_frame_every - idx
             if next_train_idx > len(scene.getTrainCameras()) - 1:
                 next_train_idx = len(scene.getTrainCameras()) - 1
-            ref_viewpoint = scene.getTrainCameras()[next_train_idx]            
-            viewpoint.update_RT(ref_viewpoint.R, ref_viewpoint.T)
-            pose_estimation_test(gaussians, viewpoint, pipeline, background)
+            ref_viewpoint = scene.getTrainCameras()[next_train_idx]
+
+            visual_localization(
+                viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher
+            )
             save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
         with torch.no_grad():
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)

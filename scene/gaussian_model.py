@@ -273,6 +273,7 @@ class GaussianModel:
         for pt in quantized.cpu().tolist():
             voxel_counts[tuple(pt)] += 1
 
+        raw_data = data.clone()
         voxel_coords = torch.tensor(list(voxel_counts.keys()), dtype=torch.float32, device=data.device) * self.voxel_size
         data = voxel_coords
         
@@ -282,14 +283,16 @@ class GaussianModel:
         
         current_voxel_size = self.voxel_size
         
-        original_data = data.clone()
-
         for depth in range(levels - 1):
             subdivided_points = []
             new_voxel_counts = defaultdict(int)
 
             next_voxel_size = current_voxel_size / 2
-            density_threshold = base_density_threshold * (1 / (current_voxel_size / self.voxel_size))
+            density_threshold = base_density_threshold
+
+            quantized_next = torch.round(raw_data / next_voxel_size)
+            unique_next, counts_next = torch.unique(quantized_next, return_counts=True, dim=0)
+            counts_map = {tuple(k.cpu().tolist()): v.item() for k, v in zip(unique_next, counts_next)}
 
             to_remove = set()
 
@@ -306,22 +309,20 @@ class GaussianModel:
                 ], dtype=torch.float32, device=data.device)
 
                 sub_voxels = pt.unsqueeze(0) + offsets * next_voxel_size
-                sub_voxels = torch.unique(sub_voxels, dim=0)
-
+                
                 valid_sub_voxels = []
                 
                 for sub in sub_voxels:
-                    sub_tuple = tuple(sub.cpu().tolist())
-
-                    count = 0
-                    for original_point in original_data:
-                        if is_inside_voxel(original_point, sub, next_voxel_size):
-                            count += 1
+                    sub_quantized = torch.round(sub / next_voxel_size)
+                    sub_tuple = tuple(sub_quantized.cpu().tolist())
                     
-                    if count > 0:
+                    count = counts_map.get(sub_tuple, 0)
+                    
+                    if count >= density_threshold:
                         valid_sub_voxels.append(sub)
-                        octree.add(sub_tuple)
-                        new_voxel_counts[sub_tuple] = count
+                        sub_coord_tuple = tuple(sub.cpu().tolist())
+                        octree.add(sub_coord_tuple)
+                        new_voxel_counts[sub_coord_tuple] = count
 
                 if valid_sub_voxels:
                     subdivided_points.append(torch.stack(valid_sub_voxels))
@@ -361,7 +362,7 @@ class GaussianModel:
         print(f'Initial voxel_size: {self.voxel_size}')
         
         
-        points, voxel_sizes = self.octree_sample(torch.tensor(points))
+        points, voxel_sizes = self.octree_sample(torch.tensor(points), levels=self.update_depth, base_density_threshold=10)
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
         voxel_sizes = voxel_sizes.cuda()  # Move voxel_sizes to CUDA
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
@@ -843,10 +844,16 @@ class GaussianModel:
             # cur_size = self.voxel_size*size_factor
             cur_size = self.voxel_size / (2 ** i)
             
-            grid_coords = torch.round(self.get_anchor / cur_size).int()
-
-            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
-            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+            if i == 0:
+                grid_coords = torch.round(self.get_anchor / cur_size).int()
+                selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
+                selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+                candidate_center_adjustment = 0.0
+            else:
+                grid_coords = torch.floor(self.get_anchor / cur_size).int()
+                selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
+                selected_grid_coords = torch.floor(selected_xyz / cur_size).int()
+                candidate_center_adjustment = 0.5 * cur_size
 
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
 
@@ -866,7 +873,7 @@ class GaussianModel:
                 remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
 
             remove_duplicates = ~remove_duplicates
-            candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
+            candidate_anchor = (selected_grid_coords_unique[remove_duplicates].float() * cur_size) + candidate_center_adjustment
 
             
             if candidate_anchor.shape[0] > 0:
@@ -987,7 +994,7 @@ class GaussianModel:
         if xyz.shape[0] == 0:
             return
 
-        candidate_anchor, voxel_sizes = self.octree_sample(xyz)
+        candidate_anchor, voxel_sizes = self.octree_sample(xyz, levels=self.update_depth, base_density_threshold=10)
 
         def compute_hash(points, voxel_size):
             hash_values = points[:, 0] * 73856093 + points[:, 1] * 19349663 + points[:, 2] * 83492791
@@ -1008,7 +1015,7 @@ class GaussianModel:
             return
 
         dist2 = torch.ones_like(candidate_anchor[:, :1]) * voxel_sizes.unsqueeze(-1)
-        new_scaling = torch.log(torch.sqrt(dist2)).repeat(1, 6)
+        new_scaling = torch.log(dist2).repeat(1, 6)
   
         new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
         new_rotation[:,0] = 1.0

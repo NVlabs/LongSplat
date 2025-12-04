@@ -12,6 +12,14 @@ import torch
 from utils.camera_utils import camera_to_JSON
 import json
 from scipy.interpolate import UnivariateSpline
+import cv2
+from scipy.optimize import least_squares
+from tqdm import tqdm
+from utils.loss_utils import l1_loss, ssim
+from utils.graphics_utils import warping
+from utils.graphics_utils import unporject
+from utils.mast3r_utils import Mast3rMatcher
+from gaussian_renderer import render
 
 def save_transforms(cameras, path):
     json_cams = []
@@ -155,3 +163,121 @@ def smooth_poses_spline(poses, st=0.5, sr=4, median_prefilter=True):
     out[:, :3, :4] = smooth_posesnp
     out[:, 3, 3] = 1.0
     return out
+
+def reprojection_error(params, points_3d, points_2d, K):
+    # Extract rotation and translation from params
+    rvec = params[:3]
+    tvec = params[3:]
+    # Project 3D points to 2D using current R and t
+    projected_points_2d, _ = cv2.projectPoints(points_3d, rvec, tvec, K, None)
+    projected_points_2d = projected_points_2d.squeeze()
+
+    # Compute the residual (difference between observed and projected points)
+    residuals = points_2d - projected_points_2d # N*1
+    return residuals.flatten()
+
+def visual_localization(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):    
+    # --- Part 1: Initialize Pose using Mast3r and PnP RANSAC ---
+    
+    # Get reference camera depth by rendering
+    ref_render_pkg = render(ref_viewpoint, gaussians, pipeline, background, retain_grad=False)
+    ref_voxel_visible_mask = ref_render_pkg["visible_mask"]
+    ref_rendered_depth = ref_render_pkg["depth"][0]
+    
+    # Get intrinsic parameters
+    intrinsic_np = viewpoint.intrinsic.detach().cpu().numpy()
+    
+    # Use mast3r for feature matching between reference and test images
+    viewpoint.kp0, viewpoint.kp1, _, _, _, _, _, _, viewpoint.pre_depth_map, viewpoint.depth_map = matcher._forward(
+        ref_viewpoint.original_image, viewpoint.original_image, intrinsic_np)
+    
+    # Set confidence and move to GPU
+    viewpoint.conf = torch.ones(viewpoint.kp0.shape[0], device=viewpoint.kp0.device)
+    viewpoint.kp0 = viewpoint.kp0.cuda()
+    viewpoint.kp1 = viewpoint.kp1.cuda()
+    viewpoint.depth_map = viewpoint.depth_map.cuda()
+    viewpoint.pre_depth_map = viewpoint.pre_depth_map.cuda()
+    
+    # Store reference viewpoint information for correspondence loss calculation
+    viewpoint.ref_viewpoint = ref_viewpoint
+    
+    # Unproject 3D points from reference depth using matched keypoints
+    pre_pts = unporject(ref_rendered_depth, ref_viewpoint.view_world_transform, ref_viewpoint.intrinsic, viewpoint.kp0)
+    
+    # Convert keypoints to pixel coordinates
+    kp1 = viewpoint.kp1 / 2 + .5
+    kp1[:, 0] *= viewpoint.original_image.shape[2]
+    kp1[:, 1] *= viewpoint.original_image.shape[1]
+    pre_pts_np = pre_pts.detach().cpu().numpy()
+    kp1_np = kp1.detach().cpu().numpy()
+    
+    # Solve PnP RANSAC with increased iterations for better accuracy
+    success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
+        pre_pts_np, kp1_np, intrinsic_np, None, 
+        iterationsCount=2000, reprojectionError=1.5, confidence=0.99, 
+        flags=cv2.SOLVEPNP_ITERATIVE)
+    
+    # Refine pose using least squares optimization with tighter tolerance
+    pre_pts_inliers = pre_pts_np[inliers].reshape(-1, 3)
+    kp1_inliers = kp1_np[inliers].reshape(-1, 2)
+    
+    initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
+    # First pass: coarse optimization
+    result = least_squares(reprojection_error, initial_params, 
+                        args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
+                        verbose=0, ftol=1e-6, xtol=1e-6, max_nfev=200)
+    # Second pass: fine optimization from first result
+    result = least_squares(reprojection_error, result.x, 
+                        args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
+                        verbose=0, ftol=1e-8, xtol=1e-8)
+    
+    rotation_vector = result.x[:3]
+    translation_vector = result.x[3:]
+    viewpoint.is_registered = True
+    
+    # Convert rotation vector to rotation matrix and update viewpoint
+    rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
+    translation_vector = translation_vector.reshape(3)
+    rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
+    translation_vector = torch.from_numpy(translation_vector).float().cuda()
+    
+    viewpoint.update_RT(rotation_matrix, translation_vector)
+
+    # --- Part 2: Pose Estimation Test (Refinement) ---
+    
+    pose_iteration = 800  # Increased iterations for better convergence
+
+    # Use smaller learning rate for rotation (more sensitive) and two-stage optimization
+    pose_optimizer = torch.optim.Adam([
+        {"params": [viewpoint.cam_trans_delta], "lr": 0.01}, 
+        {"params": [viewpoint.cam_rot_delta], "lr": 0.005}  # Smaller LR for rotation
+    ])
+    # Use step decay for better fine-tuning
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(pose_optimizer, milestones=[400, 600], gamma=0.5)
+    gt_image = viewpoint.original_image.cuda()
+
+    for iteration in range(pose_iteration):
+        render_pkg = render(viewpoint, gaussians, pipeline, background, retain_grad=True)
+        voxel_visible_mask = render_pkg["visible_mask"]
+        image = render_pkg["render"]
+        rendered_depth = render_pkg["depth"][0]
+        
+        # L1 loss
+        Ll1 = l1_loss(image, gt_image)
+        
+        # SSIM loss
+        Lssim = 1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        
+
+        loss = Ll1 * 0.8 + 0.2 * Lssim
+        
+        loss.backward()
+
+        with torch.no_grad():
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_([viewpoint.cam_trans_delta, viewpoint.cam_rot_delta], max_norm=1.0)
+            
+            pose_optimizer.step()
+            pose_optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            update_pose(viewpoint)

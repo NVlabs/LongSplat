@@ -18,12 +18,9 @@ class BasicPointCloud(NamedTuple):
     colors : np.array
     normals : np.array
 
-def geom_transform_points(points, transf_matrix):
-    P, _ = points.shape
-    ones = torch.ones(P, 1, dtype=points.dtype, device=points.device)
-    points_hom = torch.cat([points, ones], dim=1)
+def geom_transform_points(points: torch.Tensor, transf_matrix: torch.Tensor) -> torch.Tensor:
+    points_hom = torch.nn.functional.pad(points, (0, 1), value=1.0)
     points_out = torch.matmul(points_hom, transf_matrix.unsqueeze(0))
-
     denom = points_out[..., 3:] + 0.0000001
     return (points_out[..., :3] / denom).squeeze(dim=0)
 
@@ -96,7 +93,7 @@ def depth_edge(depth: torch.Tensor, atol: float = None, rtol: float = None, kern
 
 def depth2pointcloud(depth, extrinsic, intrinsic):
     H, W = depth.shape
-    v, u = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(W, device=depth.device))
+    v, u = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(W, device=depth.device), indexing='ij')
     z = depth
     edge_mask = depth_edge(depth).reshape(-1)
     x = (u - W * 0.5) * z / intrinsic[0, 0]
@@ -105,24 +102,27 @@ def depth2pointcloud(depth, extrinsic, intrinsic):
     xyz = geom_transform_points(xyz, extrinsic)[~edge_mask]
     return xyz.float()
 
-def warping(depth, extrinsic1, extrinsic2, intrinsic, keypoint):
+def warping(depth: torch.Tensor, extrinsic1: torch.Tensor, extrinsic2: torch.Tensor, 
+            intrinsic: torch.Tensor, keypoint: torch.Tensor) -> torch.Tensor:
     H, W = depth.shape
-    keypoint_x = (keypoint[:, 0] / 2 + 0.5) * W
-    keypoint_y = (keypoint[:, 1] / 2 + 0.5) * H
-    keypoints_norm = torch.stack([keypoint[:, 0], keypoint[:, 1]], dim=1).unsqueeze(0)
-    depth_values = F.grid_sample(depth.unsqueeze(0).unsqueeze(0), keypoints_norm.unsqueeze(0), mode='bilinear', align_corners=True)
-    depth_values = depth_values.squeeze()
-    z = depth_values
-    x = (keypoint_x - W * 0.5) * z / intrinsic[0, 0]
-    y = (keypoint_y - H * 0.5) * z / intrinsic[1, 1]
-    xyz = torch.stack([x, y, z], dim=0).T
+    W_half = W * 0.5
+    H_half = H * 0.5
+    fx = intrinsic[0, 0]
+    fy = intrinsic[1, 1]
+    
+    keypoint_px = (keypoint * 0.5 + 0.5) * torch.tensor([W, H], dtype=keypoint.dtype, device=keypoint.device)
+    keypoints_norm = keypoint.unsqueeze(0)
+    depth_values = F.grid_sample(depth.unsqueeze(0).unsqueeze(0), keypoints_norm.unsqueeze(0), mode='bilinear', align_corners=True).squeeze()
+    
+    xy_normalized = (keypoint_px - torch.tensor([W_half, H_half], dtype=keypoint.dtype, device=keypoint.device)) / torch.tensor([fx, fy], dtype=keypoint.dtype, device=keypoint.device)
+    xyz = torch.cat([xy_normalized, torch.ones_like(depth_values).unsqueeze(-1)], dim=-1) * depth_values.unsqueeze(-1)
+    
     xyz_world = geom_transform_points(xyz, extrinsic1)
     xyz_camera2 = geom_transform_points(xyz_world, extrinsic2)
-    u_proj = (xyz_camera2[:, 0] * intrinsic[0, 0] / xyz_camera2[:, 2] + W * 0.5)
-    v_proj = (xyz_camera2[:, 1] * intrinsic[1, 1] / xyz_camera2[:, 2] + H * 0.5)
-    u_proj = (u_proj / W - 0.5) * 2
-    v_proj = (v_proj / H - 0.5) * 2
-    uv_proj = torch.stack([u_proj, v_proj], dim=1)
+    
+    z_cam2 = xyz_camera2[:, 2:3]
+    xy_proj_px = xyz_camera2[:, :2] * torch.tensor([fx, fy], dtype=keypoint.dtype, device=keypoint.device) / z_cam2 + torch.tensor([W_half, H_half], dtype=keypoint.dtype, device=keypoint.device)
+    uv_proj = xy_proj_px / torch.tensor([W, H], dtype=keypoint.dtype, device=keypoint.device) * 2 - 1
     return uv_proj
 
 def unporject(depth, extrinsic, intrinsic, keypoint=None):
@@ -134,7 +134,7 @@ def unporject(depth, extrinsic, intrinsic, keypoint=None):
         depth_values = F.grid_sample(depth.unsqueeze(0).unsqueeze(0), keypoints_norm.unsqueeze(0), mode='bilinear', align_corners=True)
         depth_values = depth_values.squeeze()
     else:
-        keypoint_x, keypoint_y = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(W, device=depth.device))
+        keypoint_x, keypoint_y = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(W, device=depth.device), indexing='ij')
         keypoint_x = keypoint_x.reshape(H*W)
         keypoint_y = keypoint_y.reshape(H*W)
         depth_values = depth.reshape(H*W)

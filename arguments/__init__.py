@@ -78,6 +78,7 @@ class ModelParams(ParamGroup):
         self.add_color_dist = False
 
         self.mode = "free"
+        self.disable_resize = False  # Resize images to 512px long side during optimization
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -140,7 +141,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
 
         self.loss_2d_correspondence_weight = 1.0
-        self.depth_loss_weight = 0.01
+        self.depth_loss_weight = 0.1
         self.depth_l1_weight_init = 0.1
         self.depth_l1_weight_final = 0.1
         self.reproj_loss_weight_init = 1.0
@@ -165,7 +166,7 @@ class OptimizationParams(ParamGroup):
         self.local_iter = 400
         self.global_iter = 900
         self.window_size = 5
-        self.post_iter = 10000
+        self.post_iter = 20000
 
         super().__init__(parser, "Optimization Parameters")
 

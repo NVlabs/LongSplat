@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
-from torchmetrics.functional.regression import pearson_corrcoef
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -63,52 +62,24 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 
 def depth_loss(depth_gt, depth_pred, weight=None):
     assert depth_gt.shape == depth_pred.shape
-    return torch.abs(depth_gt - depth_pred).mean()
-
-def depth_loss_pearson(depth_gt, depth_pred, weight=None):
-    assert depth_gt.shape == depth_pred.shape
     depth_gt = depth_gt.reshape(-1)
     depth_pred = depth_pred.reshape(-1)
-    if weight is None:
-        return (1 - pearson_corrcoef(depth_gt, depth_pred))
-    else:
-        return (1 - pearson_corrcoef(depth_gt * weight, depth_pred * weight))
+    
+    if weight is not None:
+        depth_gt = depth_gt * weight
+        depth_pred = depth_pred * weight
+    
+    mean_gt = depth_gt.mean()
+    mean_pred = depth_pred.mean()
+    
+    centered_gt = depth_gt - mean_gt
+    centered_pred = depth_pred - mean_pred
+    
+    numerator = (centered_gt * centered_pred).sum()
+    denominator = torch.sqrt((centered_gt ** 2).sum() * (centered_pred ** 2).sum())
+    
+    pearson = numerator / (denominator + 1e-8)
+    
+    return 1 - pearson
 
-
-def correspondence_2d_loss(kp0, kp1, conf, rendered_depth, view2_world_transform, view1_world_transform, view2_intrinsic):
-    """
-    Compute 2D correspondence loss between two views.
-    
-    Args:
-        kp0: Keypoints in view1 (N, 2) - normalized coordinates [-1, 1]
-        kp1: Keypoints in view2 (N, 2) - normalized coordinates [-1, 1]
-        conf: Confidence scores for keypoints (N,)
-        rendered_depth: Rendered depth map from view2
-        view2_world_transform: World to view2 transform matrix
-        view1_world_transform: World to view1 transform matrix
-        view2_intrinsic: Intrinsic matrix of view2
-    
-    Returns:
-        loss_2d: 2D correspondence loss
-    """
-    from utils.graphics_utils import warping
-    
-    # Convert normalized coordinates to [0, 1] range
-    xy0 = kp0 / 2 + 0.5
-    xy1 = warping(rendered_depth, view2_world_transform, view1_world_transform.detach(), view2_intrinsic, kp1)
-    xy1 = xy1 / 2 + 0.5
-    
-    # Create mask for valid coordinates
-    mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
-    
-    # Apply mask to get valid correspondences
-    xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
-    
-    # Compute L1 loss weighted by confidence
-    if len(xy0) > 0:
-        loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
-    else:
-        loss_2d = torch.tensor(0.0, device=kp0.device, requires_grad=True)
-    
-    return loss_2d 
 

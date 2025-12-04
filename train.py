@@ -20,8 +20,8 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, depth_loss, correspondence_2d_loss
-from gaussian_renderer import prefilter_voxel, render, network_gui
+from utils.loss_utils import l1_loss, ssim, depth_loss
+from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -31,7 +31,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.pose_utils import save_transforms, update_pose
-from utils.graphics_utils import get_occlusion_mask, unporject, compute_scale
+from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale
 from utils.mast3r_utils import Mast3rMatcher
 import cv2
 from scipy.optimize import least_squares
@@ -48,8 +48,10 @@ except ImportError:
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
+    print("fused ssim available")
 except:
     FUSED_SSIM_AVAILABLE = False
+    print("fused ssim not available")
     
 def reprojection_error(params, points_3d, points_2d, K):
     # Extract rotation and translation from params
@@ -110,11 +112,11 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
-        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=True)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=True)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         rendered_depth = render_pkg["depth"][0]
+        voxel_visible_mask = render_pkg["visible_mask"]
 
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -137,25 +139,32 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
             view2 = viewpoint_cam
             kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-            loss_2d = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                            view2.view_world_transform, view1.world_view_transform, view2.intrinsic)
+            xy0 = kp0 / 2 + .5
+            xy1 = warping(rendered_depth, view2.view_world_transform, view1.world_view_transform.detach(), view2.intrinsic, kp1)
+            xy1 = xy1 / 2 + .5
+            mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
+            xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+            loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
             loss += loss_2d * opt.loss_2d_correspondence_weight
         
         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
             view1 = viewpoint_cam
             view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
             kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-            loss_2d_2 = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                               view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic)
+            xy0 = kp0 / 2 + .5
+            xy1 = warping(rendered_depth, view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic, kp1)
+            xy1 = xy1 / 2 + .5
+            mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
+            xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+            loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
 
         loss.backward()
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
             if iteration % 10 == 0:
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -184,6 +193,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
 
     end_view_id += 1
 
+    # PnP retry limit to avoid infinite loop
+    pnp_retry_count = {}
+    max_pnp_retries = 10
+
     while start_view_id < num_views:
         ## pose estimation ##
         opt.iterations = local_iter
@@ -199,8 +212,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 pre_viewpoint_cam1 = scene.getTrainCameras()[end_view_id-2]
                 viewpoint_cam = scene.getTrainCameras()[end_view_id-1]
 
-                voxel_visible_mask = prefilter_voxel(pre_viewpoint_cam1, gaussians, pipe,background)
-                pre_render_pkg = render(pre_viewpoint_cam1, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=False)
+                pre_render_pkg = render(pre_viewpoint_cam1, gaussians, pipe, background, retain_grad=False)
                 pre_rendered_depth = pre_render_pkg["depth"][0]
 
                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
@@ -236,7 +248,15 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 else:
                     print("Failed to solve PnP")
                     viewpoint_cam.is_registered = False
-                    end_view_id -= 1
+                    
+                    frame_id = end_view_id - 1
+                    pnp_retry_count[frame_id] = pnp_retry_count.get(frame_id, 0) + 1
+                    
+                    if pnp_retry_count[frame_id] >= max_pnp_retries:
+                        print(f"Frame {frame_id} failed PnP after {max_pnp_retries} retries, skipping...")
+                        viewpoint_cam.is_registered = True
+                    else:
+                        end_view_id -= 1
 
                 rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
                 translation_vector = translation_vector.reshape(3)
@@ -253,10 +273,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             
             progress_bar = tqdm(range(0, pose_iteration), desc="Pose estiamtion progress")
             for iteration in range(pose_iteration):
-                voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
-                render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=True)
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=True)
                 image = render_pkg["render"]
                 rendered_depth = render_pkg["depth"][0]
+                voxel_visible_mask = render_pkg["visible_mask"]
                 occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
 
                 Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
@@ -267,8 +287,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
                     view2 = viewpoint_cam
                     kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-                    loss_2d = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                                    view2.view_world_transform, view1.world_view_transform, view2.intrinsic)
+                    xy0 = kp0 / 2 + .5
+                    xy1 = warping(rendered_depth, view2.view_world_transform, view1.world_view_transform.detach(), view2.intrinsic, kp1)
+                    xy1 = xy1 / 2 + .5
+                    mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
+                    xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                    loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
                     loss += loss_2d * opt.loss_2d_correspondence_weight
 
                 loss.backward()
@@ -281,7 +305,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     update_pose(viewpoint_cam)
 
                     if iteration % 10 == 0:
-                        progress_bar.set_postfix({"Loss": f"{loss:.{7}f}"})
+                        progress_bar.set_postfix({"Loss": f"{loss.item():.{7}f}"})
                         progress_bar.update(10)
             
             progress_bar.close()
@@ -315,9 +339,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             if (iteration - 1) == debug_from:
                 pipe.debug = True
             
-            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
             retain_grad = (iteration < opt.update_until and iteration >= 0)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=retain_grad)
+            voxel_visible_mask = render_pkg["visible_mask"]
             
             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
             rendered_depth = render_pkg["depth"][0]
@@ -343,25 +367,34 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
                 view2 = viewpoint_cam
                 kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-                loss_2d = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                                view2.view_world_transform, view1.world_view_transform, view2.intrinsic)
+                xy0 = kp0 / 2 + .5
+                xy1 = warping(rendered_depth, view2.view_world_transform, view1.world_view_transform.detach(), view2.intrinsic, kp1)
+                xy1 = xy1 / 2 + .5
+                mask = (xy1 > 0.) & (xy1 < 1.)
+                mask = mask.all(dim=-1)
+                xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
                 loss += loss_2d * opt.loss_2d_correspondence_weight
             
             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
                 view1 = viewpoint_cam
                 view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
                 kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-                loss_2d_2 = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                                   view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic)
+                xy0 = kp0 / 2 + .5
+                xy1 = warping(rendered_depth, view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic, kp1)
+                xy1 = xy1 / 2 + .5
+                mask = (xy1 > 0.) & (xy1 < 1.)
+                mask = mask.all(dim=-1)
+                xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
 
             loss.backward()
 
             with torch.no_grad():
                 # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
                 if iteration % 10 == 0:
+                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                     progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                     progress_bar.update(10)
                 if iteration == opt.iterations:
@@ -417,9 +450,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             if (iteration - 1) == debug_from:
                 pipe.debug = True
             
-            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
             retain_grad = (iteration < opt.update_until and iteration >= 0)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=retain_grad)
+            voxel_visible_mask = render_pkg["visible_mask"]
             
             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
             rendered_depth = render_pkg["depth"][0]
@@ -445,25 +478,34 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
                 view2 = viewpoint_cam
                 kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-                loss_2d = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                                view2.view_world_transform, view1.world_view_transform, view2.intrinsic)
+                xy0 = kp0 / 2 + .5
+                xy1 = warping(rendered_depth, view2.view_world_transform, view1.world_view_transform.detach(), view2.intrinsic, kp1)
+                xy1 = xy1 / 2 + .5
+                mask = (xy1 > 0.) & (xy1 < 1.)
+                mask = mask.all(dim=-1)
+                xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
                 loss += loss_2d * opt.loss_2d_correspondence_weight
             
             if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
                 view1 = viewpoint_cam
                 view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
                 kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-                loss_2d_2 = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                                   view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic)
+                xy0 = kp0 / 2 + .5
+                xy1 = warping(rendered_depth, view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic, kp1)
+                xy1 = xy1 / 2 + .5
+                mask = (xy1 > 0.) & (xy1 < 1.)
+                mask = mask.all(dim=-1)
+                xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+                loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
                 loss += loss_2d_2 * opt.loss_2d_correspondence_weight
             
             loss.backward()
 
             with torch.no_grad():
                 # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
                 if iteration % 10 == 0:
+                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                     progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                     progress_bar.update(10)
                 if iteration == opt.iterations:
@@ -491,16 +533,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     update_pose(viewpoint_cam)
 
         with torch.no_grad():
-            if end_view_id % 100 == 0:
-                training_report(tb_writer, dataset_name, Ll1, loss, l1_loss, scene, render, (pipe, background), end_view_id, logger)    
-
             if end_view_id < num_views:
                 end_viewpoint_cam = scene.getTrainCameras()[end_view_id - 1]
-                end_visible_mask = prefilter_voxel(end_viewpoint_cam, gaussians, pipe, background)
-                render_pkg = render(end_viewpoint_cam, gaussians, pipe, background,
-                                    visible_mask=end_visible_mask, retain_grad=False)
-                offset_selection_mask = render_pkg["selection_mask"]
-                end_n_touched = (render_pkg["n_touched"] > 0)
+                render_pkg_end = render(end_viewpoint_cam, gaussians, pipe, background)
+                end_visible_mask = render_pkg_end["visible_mask"]
+                offset_selection_mask = render_pkg_end["selection_mask"]
+                end_n_touched = (render_pkg_end["n_touched"] > 0)
                 
                 mask_size = gaussians.get_anchor.shape[0] * gaussians.n_offsets
                 end_mask = torch.empty(mask_size, dtype=torch.bool, device="cuda")
@@ -514,11 +552,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 
                 for start_viewpoint_cam in scene.getTrainCameras()[start_view_id:end_view_id - 1]:
                     start_mask.zero_()
-                    start_visible_mask = prefilter_voxel(start_viewpoint_cam, gaussians, pipe, background)
-                    render_pkg = render(start_viewpoint_cam, gaussians, pipe, background,
-                                        visible_mask=start_visible_mask, retain_grad=False)
-                    offset_selection_mask = render_pkg["selection_mask"]
-                    start_n_touched = (render_pkg["n_touched"] > 0)
+                    render_pkg_start = render(start_viewpoint_cam, gaussians, pipe, background)
+                    start_visible_mask = render_pkg_start["visible_mask"]
+                    offset_selection_mask = render_pkg_start["selection_mask"]
+                    start_n_touched = (render_pkg_start["n_touched"] > 0)
                     
                     start_visible_mask_expand = start_visible_mask.unsqueeze(0).expand(gaussians.n_offsets, -1).reshape(-1)
                     visible_indices = torch.nonzero(start_visible_mask_expand).squeeze(1)
@@ -548,12 +585,12 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
     
     if opt.pruning_ratio > 0:
         with torch.no_grad():
-            anchor_touched_list = torch.empty(gaussians.get_anchor.shape[0] * gaussians.n_offsets, device="cuda")
+            anchor_touched_list = torch.zeros(gaussians.get_anchor.shape[0] * gaussians.n_offsets, device="cuda")
             for view in scene.getTrainCameras()[0:end_view_id]:
-                voxel_visible_mask = prefilter_voxel(view, gaussians, pipe, background)
-                render_pkg = render(view, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=False)
+                render_pkg = render(view, gaussians, pipe, background, retain_grad=False)
                 n_touched = render_pkg["n_touched"]
                 offset_selection_mask = render_pkg["selection_mask"]
+                voxel_visible_mask = render_pkg["visible_mask"]
                 visible_mask_expand = voxel_visible_mask.unsqueeze(0).expand(gaussians.n_offsets, -1).reshape(-1)
                 visible_indices = torch.nonzero(visible_mask_expand).squeeze(1)
                 final_indices = visible_indices[offset_selection_mask]
@@ -605,9 +642,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
-        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=retain_grad)
+        voxel_visible_mask = render_pkg["visible_mask"]
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         rendered_depth = render_pkg["depth"][0]
@@ -622,7 +659,6 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
-
         # Depth loss
         if opt.depth_loss_weight > 0:
             midas_depth = viewpoint_cam.depth_map.detach().cuda()
@@ -634,25 +670,32 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             view1 = scene.getTrainCameras()[viewpoint_cam.uid - 1]
             view2 = viewpoint_cam
             kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-            loss_2d = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                            view2.view_world_transform, view1.world_view_transform, view2.intrinsic)
+            xy0 = kp0 / 2 + .5
+            xy1 = warping(rendered_depth, view2.view_world_transform, view1.world_view_transform.detach(), view2.intrinsic, kp1)
+            xy1 = xy1 / 2 + .5
+            mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
+            xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+            loss_2d = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
             loss += loss_2d * opt.loss_2d_correspondence_weight
         
         if opt.loss_2d_correspondence_weight > 0 and viewpoint_cam.uid < end_view_id - 2:
             view1 = viewpoint_cam
             view2 = scene.getTrainCameras()[viewpoint_cam.uid + 1]
             kp0, kp1, conf = view2.kp0.cuda(), view2.kp1.cuda(), view2.conf.cuda()
-            loss_2d_2 = correspondence_2d_loss(kp0, kp1, conf, rendered_depth, 
-                                               view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic)
+            xy0 = kp0 / 2 + .5
+            xy1 = warping(rendered_depth, view2.view_world_transform.detach(), view1.world_view_transform, view2.intrinsic, kp1)
+            xy1 = xy1 / 2 + .5
+            mask = torch.logical_and(xy1 > 0., xy1 < 1.).all(dim=-1)
+            xy0, xy1, conf = xy0[mask], xy1[mask], conf[mask]
+            loss_2d_2 = ((xy0.detach() - xy1).abs() * conf[:, None]).mean()
             loss += loss_2d_2 * opt.loss_2d_correspondence_weight
 
         loss.backward()
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
             if iteration % 10 == 0:
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -723,8 +766,9 @@ def training_report(tb_writer, dataset_name, Ll1, loss, l1_loss, scene : Scene, 
             psnr_test = 0.0
 
             for idx, viewpoint in enumerate(config['cameras']):
-                voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
-                image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
+                render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                voxel_visible_mask = render_pkg["visible_mask"]
                 gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                 if tb_writer and (idx < 30):
                     tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=end_view_id)

@@ -17,7 +17,7 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
 from scene import Scene
-from gaussian_renderer import render3dgs, render, prefilter_voxel
+from gaussian_renderer import render3dgs, render
 from tqdm import tqdm
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
@@ -59,10 +59,10 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
         gaussians.train()
         anchor_touched_list = torch.zeros(gaussians.get_anchor.shape[0] * gaussians.n_offsets, device="cuda")
         for view in scene.getTrainCameras():
-            voxel_visible_mask = prefilter_voxel(view, gaussians, pipe, background)
-            render_pkg = render(view, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=False)
+            render_pkg = render(view, gaussians, pipe, background, retain_grad=False)
             n_touched = render_pkg["n_touched"]
             offset_selection_mask = render_pkg["selection_mask"]
+            voxel_visible_mask = render_pkg["visible_mask"]
             visible_mask_expand = voxel_visible_mask.unsqueeze(0).expand(gaussians.n_offsets, -1).reshape(-1)
             visible_indices = torch.nonzero(visible_mask_expand).squeeze(1)
             final_indices = visible_indices[offset_selection_mask]
