@@ -15,6 +15,7 @@ from utils.graphics_utils import fov2focal
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale):
+    global WARNED
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
@@ -22,7 +23,6 @@ def loadCam(args, id, cam_info, resolution_scale):
     else:  # should be a type that converts to float
         if args.resolution == -1:
             if orig_w > 1600:
-                global WARNED
                 if not WARNED:
                     print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
                         "If this is not desired, please explicitly specify '--resolution/-r' as 1")
@@ -34,7 +34,6 @@ def loadCam(args, id, cam_info, resolution_scale):
             global_down = orig_w / args.resolution
         
         if args.disable_resize and orig_w > 1280:
-            global WARNED
             if not WARNED:
                 print("[ INFO ] Encountered quite large input images but resizing is disabled.\n "
                       "If this is not desired, please explicitly specify '--disable-resize' as False")
