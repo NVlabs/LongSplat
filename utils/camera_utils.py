@@ -32,6 +32,13 @@ def loadCam(args, id, cam_info, resolution_scale):
                 global_down = 1
         else:
             global_down = orig_w / args.resolution
+        
+        if args.disable_resize and orig_w > 1280:
+            global WARNED
+            if not WARNED:
+                print("[ INFO ] Encountered quite large input images but resizing is disabled.\n "
+                      "If this is not desired, please explicitly specify '--disable-resize' as False")
+                WARNED = True
 
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))

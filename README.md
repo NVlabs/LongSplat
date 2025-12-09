@@ -36,6 +36,8 @@ LongSplat is an unposed 3D Gaussian Splatting framework for robust reconstructio
 
 ## News
 
+⚠️ **2025.12.10**: Fixed training and eval pipeline for reproduction results.
+
 🎉 **2025.08.27**: Release converter to 3DGS format for compatibility with general 3DGS viewers. See [Convert to 3DGS Format](#convert-to-3dgs-format) section.
 
 🎉 **2025.08.20**: Code release!
