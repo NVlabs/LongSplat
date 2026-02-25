@@ -28,7 +28,7 @@ from utils.image_utils import psnr
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
-except:
+except Exception:
     FUSED_SSIM_AVAILABLE = False
 
 def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int, pipe : PipelineParams, pruning_ratio : float = 0.6):
