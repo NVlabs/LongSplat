@@ -173,7 +173,7 @@ def fetchPly(path):
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     try:
         colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    except:
+    except Exception:
         colors = np.random.rand(positions.shape[0], positions.shape[1])
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
@@ -298,17 +298,17 @@ def readEvalSceneInfo(path, model_path, images, eval, llffhold=8):
                 print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
                 try:
                     xyz, rgb, _ = read_points3D_binary(bin_path)
-                except:
+                except Exception:
                     try:
                         xyz, rgb, _ = read_points3D_text(txt_path)
-                    except:
+                    except Exception:
                         print("Failed to load point cloud data")
                         xyz, rgb = None, None
                 if xyz is not None:
                     storePly(ply_path, xyz, rgb)
             try:
                 pcd = fetchPly(ply_path)
-            except:
+            except Exception:
                 pcd = None
         else:
             print("Skipping point cloud loading as GT poses are not available")
@@ -383,7 +383,7 @@ def readFreeSceneInfo(path, images, eval, llffhold=8):
             cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
             cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
             cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-        except:
+        except Exception:
             cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
             cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
             cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
@@ -411,7 +411,7 @@ def readFreeSceneInfo(path, images, eval, llffhold=8):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except Exception:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
 
@@ -431,7 +431,7 @@ def readTanksSceneInfo(path, images, eval, llffhold=8):
             cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
             cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
             cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-        except:
+        except Exception:
             cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
             cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
             cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
@@ -463,7 +463,7 @@ def readTanksSceneInfo(path, images, eval, llffhold=8):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except Exception:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
 
@@ -497,7 +497,7 @@ def readHikeSceneInfo(path, images, eval, llffhold=10):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except Exception:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
 
@@ -523,14 +523,14 @@ def readCustomSceneInfo(path, images, eval, llffhold=8):
             cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
             cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
             has_camera_data = True
-        except:
+        except Exception:
             try:
                 cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
                 cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
                 cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
                 cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
                 has_camera_data = True
-            except:
+            except Exception:
                 print("No valid camera data found in sparse folder, proceeding without camera poses")
                 has_camera_data = False
     
@@ -567,18 +567,18 @@ def readCustomSceneInfo(path, images, eval, llffhold=8):
             try:
                 xyz, rgb, _ = read_points3D_binary(bin_path)
                 storePly(ply_path, xyz, rgb)
-            except:
+            except Exception:
                 try:
                     xyz, rgb, _ = read_points3D_text(txt_path)
                     storePly(ply_path, xyz, rgb)
-                except:
+                except Exception:
                     print("No valid point cloud data found, proceeding without point cloud")
                     ply_path = None
         
         if ply_path and os.path.exists(ply_path):
             try:
                 pcd = fetchPly(ply_path)
-            except:
+            except Exception:
                 print("Failed to load point cloud from PLY file")
                 pcd = None
                 ply_path = None

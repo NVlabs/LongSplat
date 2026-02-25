@@ -49,7 +49,7 @@ try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
     print("fused ssim available")
-except:
+except Exception:
     FUSED_SSIM_AVAILABLE = False
     print("fused ssim not available")
     
