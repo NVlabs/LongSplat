@@ -63,7 +63,7 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
     name_list = []
     for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
         nvs_view = Camera(colmap_id=i, R=None, T=None, R_gt=None, T_gt=None, FoVx=FoVx, FoVy=FoVy, 
-                         image=views[0].original_image, gt_alpha_mask=None, image_name=None, uid=None)
+                         image=views[i].original_image, gt_alpha_mask=None, image_name=None, uid=None)
         nvs_view.update_RT(nvs_pose_list[i, :3, :3].transpose(0, 1), nvs_pose_list[i, :3, 3])
         nvs_view.to_final()
         rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
