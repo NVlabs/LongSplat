@@ -187,6 +187,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                torch.nn.utils.clip_grad_norm_([viewpoint_cam.cam_trans_delta, viewpoint_cam.cam_rot_delta], max_norm=1.0)
                 gaussians.pose_optimizer.step()
                 gaussians.pose_optimizer.zero_grad(set_to_none = True)
                 update_pose(viewpoint_cam)
@@ -417,6 +418,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                    torch.nn.utils.clip_grad_norm_([viewpoint_cam.cam_trans_delta, viewpoint_cam.cam_rot_delta], max_norm=1.0)
                     gaussians.pose_optimizer.step()
                     gaussians.pose_optimizer.zero_grad(set_to_none = True)
                     update_pose(viewpoint_cam)
@@ -528,6 +530,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                    torch.nn.utils.clip_grad_norm_([viewpoint_cam.cam_trans_delta, viewpoint_cam.cam_rot_delta], max_norm=1.0)
                     gaussians.pose_optimizer.step()
                     gaussians.pose_optimizer.zero_grad(set_to_none = True)
                     update_pose(viewpoint_cam)
@@ -718,6 +721,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                torch.nn.utils.clip_grad_norm_([viewpoint_cam.cam_trans_delta, viewpoint_cam.cam_rot_delta], max_norm=1.0)
                 gaussians.pose_optimizer.step()
                 gaussians.pose_optimizer.zero_grad(set_to_none = True)
                 update_pose(viewpoint_cam)
