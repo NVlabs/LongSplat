@@ -119,6 +119,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize(); t0 = time.time()
         rendering = render(view, gaussians, pipeline, background)
         voxel_visible_mask = rendering["visible_mask"]
+        per_view_dict['{0:05d}'.format(idx)] = voxel_visible_mask.sum().item()
         torch.cuda.synchronize(); t1 = time.time()
         
         t_list.append(t1-t0)
